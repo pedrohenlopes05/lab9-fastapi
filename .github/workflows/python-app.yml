@@ -112,7 +112,6 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          script_stop: true
           script: |
             set -e
             IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
@@ -129,7 +128,7 @@ jobs:
               "$IMAGE"
 
             echo ">> Validando a aplicação"
-            curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-connrefused \
+            curl --fail --silent --show-error --retry 20 --retry-delay 3 --retry-all-errors \
               "http://localhost:${{ env.HOMOL_PORT }}${{ env.HEALTH_PATH }}" > /dev/null \
               || { echo "Health check falhou. Últimos logs:"; docker logs --tail 50 ${{ env.CONTAINER_NAME }}; exit 1; }
 
@@ -157,7 +156,6 @@ jobs:
           host: ${{ secrets.EC2_HOST }}
           username: ${{ secrets.EC2_USERNAME }}
           key: ${{ secrets.EC2_SSH_KEY }}
-          script_stop: true
           script: |
             set -e
             IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
@@ -174,7 +172,7 @@ jobs:
               "$IMAGE"
 
             echo ">> Validando a aplicação"
-            curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-connrefused \
+            curl --fail --silent --show-error --retry 20 --retry-delay 3 --retry-all-errors \
               "http://localhost:${{ env.PROD_PORT }}${{ env.HEALTH_PATH }}" > /dev/null \
               || { echo "Health check falhou. Últimos logs:"; docker logs --tail 50 ${{ env.CONTAINER_NAME }}; exit 1; }
 
