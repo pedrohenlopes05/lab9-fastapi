@@ -1,0 +1,182 @@
+# Caminho no repositório: .github/workflows/python-app.yml
+#
+# Fluxo:
+#   push em develop -> Build -> Imagem -> Deploy_Homologacao (automático, porta 8080)
+#   push em main    -> Build -> Imagem -> aprovação manual -> Deploy_Producao
+#
+# Secrets necessários:
+#   Repositório ............ DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
+#   Environment homologacao  EC2_HOST, EC2_USERNAME, EC2_SSH_KEY  (EC2 de homologação)
+#   Environment producao ... EC2_HOST, EC2_USERNAME, EC2_SSH_KEY  (NOVA EC2 de produção)
+
+name: Python App - CI/CD
+
+on:
+  push:
+    branches: [ "develop", "main" ]
+  pull_request:
+    branches: [ "develop", "main" ]
+
+permissions:
+  contents: read
+
+# Variáveis globais: altere aqui e vale para todos os jobs (use ${{ env.NOME }})
+env:
+  PYTHON_VERSION: "3.12"
+  IMAGE_NAME: fastapi-app        # imagem final: <usuario-dockerhub>/<IMAGE_NAME>
+  CONTAINER_NAME: fastapi-app    # nome do container nas EC2
+  APP_PORT: "8000"               # porta do uvicorn DENTRO do container (confira no Dockerfile)
+  HOMOL_PORT: "8080"             # porta publicada na EC2 de homologação
+  PROD_PORT: "80"                # porta publicada na EC2 de produção
+  HEALTH_PATH: /docs             # rota usada para validar o deploy
+
+jobs:
+  # ---------------------------------------------------------------------------
+  # 1) BUILD + TESTES  (roda em push e em pull request)
+  # ---------------------------------------------------------------------------
+  build:
+    name: Build e Testes
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v6
+
+      - name: Configurar Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: ${{ env.PYTHON_VERSION }}
+
+      - name: Instalar dependências
+        run: |
+          python -m pip install --upgrade pip
+          pip install flake8 pytest
+          if [ -f requirements.txt ]; then pip install -r requirements.txt; fi
+
+      - name: Lint (flake8)
+        run: |
+          # quebra o build em erros de sintaxe e nomes indefinidos
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # demais avisos de estilo são só informativos
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Testes (pytest)
+        run: pytest
+
+  # ---------------------------------------------------------------------------
+  # 2) IMAGEM DOCKER  (só em push: pull request apenas valida, não publica)
+  # ---------------------------------------------------------------------------
+  imagem:
+    name: Build e Push da Imagem
+    needs: build
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout do código
+        uses: actions/checkout@v6
+
+      - name: Configurar Docker Buildx
+        uses: docker/setup-buildx-action@v4
+
+      - name: Login no Docker Hub
+        uses: docker/login-action@v4
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build e push da imagem
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          push: true
+          # tag do commit (rastreável) + tag móvel por branch
+          tags: |
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}
+            ${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.ref_name == 'main' && 'latest' || 'develop' }}
+
+  # ---------------------------------------------------------------------------
+  # 3) DEPLOY EM HOMOLOGAÇÃO  (automático ao fazer push/merge em develop)
+  # ---------------------------------------------------------------------------
+  Deploy_Homologacao:
+    name: Deploy em Homologação
+    needs: imagem
+    if: github.ref == 'refs/heads/develop'
+    runs-on: ubuntu-latest
+    environment: homologacao          # sem regras de proteção = deploy automático
+    concurrency:
+      group: deploy-homologacao
+      cancel-in-progress: false
+    steps:
+      - name: Deploy na EC2 de homologação
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
+            IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+
+            echo ">> Baixando a imagem"
+            docker pull "$IMAGE"
+
+            echo ">> Substituindo o container"
+            docker rm -f ${{ env.CONTAINER_NAME }} || true
+            docker run -d \
+              --name ${{ env.CONTAINER_NAME }} \
+              --restart unless-stopped \
+              -p ${{ env.HOMOL_PORT }}:${{ env.APP_PORT }} \
+              "$IMAGE"
+
+            echo ">> Validando a aplicação"
+            curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-connrefused \
+              "http://localhost:${{ env.HOMOL_PORT }}${{ env.HEALTH_PATH }}" > /dev/null \
+              || { echo "Health check falhou. Últimos logs:"; docker logs --tail 50 ${{ env.CONTAINER_NAME }}; exit 1; }
+
+            docker image prune -af --filter "until=24h"
+            echo ">> Homologação atualizada"
+
+  # ---------------------------------------------------------------------------
+  # 4) DEPLOY EM PRODUÇÃO  (somente main + aprovação manual)
+  # ---------------------------------------------------------------------------
+  Deploy_Producao:
+    name: Deploy em Produção
+    needs: imagem
+    if: github.ref == 'refs/heads/main'
+    runs-on: ubuntu-latest
+    # O environment "producao" tem Required reviewers: o job fica em "Waiting"
+    # até um revisor aprovar. Só depois disso ele acessa os secrets do environment.
+    environment: producao
+    concurrency:
+      group: deploy-producao
+      cancel-in-progress: false
+    steps:
+      - name: Deploy na EC2 de produção
+        uses: appleboy/ssh-action@v1
+        with:
+          host: ${{ secrets.EC2_HOST }}
+          username: ${{ secrets.EC2_USERNAME }}
+          key: ${{ secrets.EC2_SSH_KEY }}
+          script_stop: true
+          script: |
+            set -e
+            IMAGE="${{ secrets.DOCKERHUB_USERNAME }}/${{ env.IMAGE_NAME }}:${{ github.sha }}"
+
+            echo ">> Baixando a imagem"
+            docker pull "$IMAGE"
+
+            echo ">> Substituindo o container"
+            docker rm -f ${{ env.CONTAINER_NAME }} || true
+            docker run -d \
+              --name ${{ env.CONTAINER_NAME }} \
+              --restart unless-stopped \
+              -p ${{ env.PROD_PORT }}:${{ env.APP_PORT }} \
+              "$IMAGE"
+
+            echo ">> Validando a aplicação"
+            curl --fail --silent --show-error --retry 10 --retry-delay 3 --retry-connrefused \
+              "http://localhost:${{ env.PROD_PORT }}${{ env.HEALTH_PATH }}" > /dev/null \
+              || { echo "Health check falhou. Últimos logs:"; docker logs --tail 50 ${{ env.CONTAINER_NAME }}; exit 1; }
+
+            docker image prune -af --filter "until=24h"
+            echo ">> Produção atualizada"
